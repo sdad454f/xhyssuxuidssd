@@ -1,4 +1,4 @@
-name: f DB Backup to R2
+name: t DB Backup to R2
 
 on:
   schedule:
