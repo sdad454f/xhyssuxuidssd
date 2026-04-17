@@ -2,7 +2,7 @@ name: Secure DB Backup to R2
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 17 * * *'
   workflow_dispatch:
 
 jobs:
@@ -34,7 +34,7 @@ jobs:
           EOF
 
       # ---------------------------------------------------------
-      # 1. Dump STRUCTURE (no data, no collation, no charset)
+      # 1. Dump STRUCTURE (no data)
       # ---------------------------------------------------------
       - name: Dump Structure
         run: |
@@ -60,21 +60,31 @@ jobs:
           if [ $? -ne 0 ]; then echo "Error"; exit 1; fi
 
       # ---------------------------------------------------------
-      # 2. Normalize STRUCTURE (remove collation, charset, etc.)
+      # 2. Normalize STRUCTURE（处理排序规则 / 字符集）
       # ---------------------------------------------------------
       - name: Normalize Structure
         run: |
           cp structure_raw.sql structure_clean.sql
 
-          sed -i 's/ COLLATE [^ ]*//g' structure_clean.sql
-          sed -i 's/ CHARACTER SET [^ ]*//g' structure_clean.sql
+          # 直接把 MySQL 8 专用排序规则换成兼容的
+          sed -i 's/utf8mb4_0900_ai_ci/utf8mb4_general_ci/g' structure_clean.sql
+          sed -i 's/utf8mb4_0900_bin/utf8mb4_general_ci/g' structure_clean.sql
+
+          # 避免 utf8mb3，统一成 utf8mb4
+          sed -i 's/utf8mb3/utf8mb4/g' structure_clean.sql
+
+          # 可选：清理 CHECK / INVISIBLE / 生成列
           sed -i 's/ CHECK ([^)]*)//g' structure_clean.sql
           sed -i 's/ INVISIBLE//g' structure_clean.sql
           sed -i 's/ GENERATED ALWAYS AS ([^)]*) VIRTUAL//g' structure_clean.sql
           sed -i 's/ GENERATED ALWAYS AS ([^)]*) STORED//g' structure_clean.sql
 
+          # 压缩结构文件，单独保留一个小包
+          cp structure_clean.sql structure_only.sql
+          gzip structure_only.sql
+
       # ---------------------------------------------------------
-      # 3. Dump DATA (保留你原来的所有参数)
+      # 3. Dump DATA（保留你原来的所有参数）
       # ---------------------------------------------------------
       - name: Dump Data
         run: |
@@ -100,10 +110,16 @@ jobs:
 
       # ---------------------------------------------------------
       # 4. Merge STRUCTURE + DATA → full_backup.sql
+      #   （顺手再保险：再跑一遍排序规则替换）
       # ---------------------------------------------------------
       - name: Merge SQL Files
         run: |
           cat structure_clean.sql data.sql > full_backup.sql
+
+          # 再保险：如果 data 段里哪天混进 collation，也一锅端
+          sed -i 's/utf8mb4_0900_ai_ci/utf8mb4_general_ci/g' full_backup.sql
+          sed -i 's/utf8mb4_0900_bin/utf8mb4_general_ci/g' full_backup.sql
+          sed -i 's/utf8mb3/utf8mb4/g' full_backup.sql
 
           gzip full_backup.sql
 
@@ -111,11 +127,16 @@ jobs:
           if [ "$FILE_SIZE" -lt 10240 ]; then echo "Error"; exit 1; fi
 
       # ---------------------------------------------------------
-      # 5. Upload to R2
+      # 5. Upload to R2（两个压缩包：结构 + 全量）
       # ---------------------------------------------------------
       - name: Upload to R2
         run: |
           set +x
+          rclone copy structure_only.sql.gz r2:${{ secrets.R2_BUCKET }}/db-backups \
+            --s3-no-check-bucket --checksum -q >/dev/null 2>&1
+
+          if [ $? -ne 0 ]; then echo "Error"; exit 1; fi
+
           rclone copy full_backup.sql.gz r2:${{ secrets.R2_BUCKET }}/db-backups \
             --s3-no-check-bucket --checksum -q >/dev/null 2>&1
 
@@ -124,13 +145,14 @@ jobs:
           echo "Success"
 
       # ---------------------------------------------------------
-      # 6. Cleanup
+      # 6. Cleanup（只清本地，不动 R2）
       # ---------------------------------------------------------
       - name: Cleanup
         if: always()
         run: |
           rm -rf ~/.config/rclone >/dev/null 2>&1
-          rm -f structure_raw.sql structure_clean.sql data.sql full_backup.sql.gz >/dev/null 2>&1
+          rm -f structure_raw.sql structure_clean.sql data.sql >/dev/null 2>&1
+          rm -f full_backup.sql.gz structure_only.sql.gz >/dev/null 2>&1
 
       # ---------------------------------------------------------
       # 7. Keepalive commit
