@@ -2,14 +2,15 @@ name: Secure DB Backup to R2
 
 on:
   schedule:
-    - cron: '0 17 * * *'
+    - cron: '0 */4 * * *'
   workflow_dispatch:
 
 jobs:
   backup:
     runs-on: ubuntu-latest
     permissions:
-      contents: write        # 必须！允许 action 推送 commit
+      contents: write
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
@@ -32,52 +33,108 @@ jobs:
           acl = private
           EOF
 
-      - name: Dump & Verify
+      # ---------------------------------------------------------
+      # 1. Dump STRUCTURE (no data, no collation, no charset)
+      # ---------------------------------------------------------
+      - name: Dump Structure
         run: |
           set -o pipefail
           set +x
 
           mysqldump \
-            --single-transaction --quick --skip-extended-insert --complete-insert \
+            --no-data \
+            --skip-comments \
             --set-gtid-purged=OFF \
             --default-character-set=utf8mb4 \
             --column-statistics=0 \
+            --no-tablespaces \
+            --skip-triggers \
+            --skip-routines \
+            --skip-events \
+            --compact \
             -h${{ secrets.DB_HOST }} -P${{ secrets.DB_PORT }} \
             -u${{ secrets.DB_USER }} -p"${{ secrets.DB_PASSWORD }}" \
+            ${{ secrets.DB_DATA }} \
+            > structure_raw.sql 2>/dev/null
+
+          if [ $? -ne 0 ]; then echo "Error"; exit 1; fi
+
+      # ---------------------------------------------------------
+      # 2. Normalize STRUCTURE (remove collation, charset, etc.)
+      # ---------------------------------------------------------
+      - name: Normalize Structure
+        run: |
+          cp structure_raw.sql structure_clean.sql
+
+          sed -i 's/ COLLATE [^ ]*//g' structure_clean.sql
+          sed -i 's/ CHARACTER SET [^ ]*//g' structure_clean.sql
+          sed -i 's/ CHECK ([^)]*)//g' structure_clean.sql
+          sed -i 's/ INVISIBLE//g' structure_clean.sql
+          sed -i 's/ GENERATED ALWAYS AS ([^)]*) VIRTUAL//g' structure_clean.sql
+          sed -i 's/ GENERATED ALWAYS AS ([^)]*) STORED//g' structure_clean.sql
+
+      # ---------------------------------------------------------
+      # 3. Dump DATA (保留你原来的所有参数)
+      # ---------------------------------------------------------
+      - name: Dump Data
+        run: |
+          set -o pipefail
+          set +x
+
+          mysqldump \
+            --no-create-info \
+            --single-transaction \
+            --quick \
+            --skip-extended-insert \
+            --complete-insert \
+            --set-gtid-purged=OFF \
+            --default-character-set=utf8mb4 \
+            --column-statistics=0 \
             --ssl-mode=DISABLED \
-            --databases ${{ secrets.DB_DATA }} \
-            2>/dev/null \
-            | gzip > latest_backup.sql.gz 2>/dev/null
+            -h${{ secrets.DB_HOST }} -P${{ secrets.DB_PORT }} \
+            -u${{ secrets.DB_USER }} -p"${{ secrets.DB_PASSWORD }}" \
+            ${{ secrets.DB_DATA }} \
+            > data.sql 2>/dev/null
 
-          if [ $? -ne 0 ]; then
-            echo "Error"
-            exit 1
-          fi
+          if [ $? -ne 0 ]; then echo "Error"; exit 1; fi
 
-          FILE_SIZE=$(stat -c%s latest_backup.sql.gz)
-          if [ "$FILE_SIZE" -lt 10240 ]; then
-            echo "Error"
-            exit 1
-          fi
+      # ---------------------------------------------------------
+      # 4. Merge STRUCTURE + DATA → full_backup.sql
+      # ---------------------------------------------------------
+      - name: Merge SQL Files
+        run: |
+          cat structure_clean.sql data.sql > full_backup.sql
 
+          gzip full_backup.sql
+
+          FILE_SIZE=$(stat -c%s full_backup.sql.gz)
+          if [ "$FILE_SIZE" -lt 10240 ]; then echo "Error"; exit 1; fi
+
+      # ---------------------------------------------------------
+      # 5. Upload to R2
+      # ---------------------------------------------------------
       - name: Upload to R2
         run: |
           set +x
-          rclone copy latest_backup.sql.gz r2:${{ secrets.R2_BUCKET }}/db-backups/ \
+          rclone copy full_backup.sql.gz r2:${{ secrets.R2_BUCKET }}/db-backups \
             --s3-no-check-bucket --checksum -q >/dev/null 2>&1
 
-          if [ $? -ne 0 ]; then
-            echo "Error"
-            exit 1
-          fi
+          if [ $? -ne 0 ]; then echo "Error"; exit 1; fi
 
           echo "Success"
 
+      # ---------------------------------------------------------
+      # 6. Cleanup
+      # ---------------------------------------------------------
       - name: Cleanup
         if: always()
         run: |
           rm -rf ~/.config/rclone >/dev/null 2>&1
-          rm -f latest_backup.sql.gz >/dev/null 2>&1
+          rm -f structure_raw.sql structure_clean.sql data.sql full_backup.sql.gz >/dev/null 2>&1
+
+      # ---------------------------------------------------------
+      # 7. Keepalive commit
+      # ---------------------------------------------------------
       - name: Create keep-alive commit
         run: |
           echo "Last backup: $(date -u '+%Y-%m-%d %H:%M:%S UTC') | ID: $(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 8)" > keepalive.md
@@ -88,6 +145,6 @@ jobs:
       - name: Commit & Push if changed
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: ...
+          commit_message: "keepalive"
           file_pattern: keepalive.md
-          push_options: '--force'    # 或 --force-with-lease
+          push_options: '--force'
