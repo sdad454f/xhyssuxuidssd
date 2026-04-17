@@ -1,0 +1,93 @@
+name: F DB Backup to R2
+
+on:
+  schedule:
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # 必须！允许 action 推送 commit
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update -qq >/dev/null 2>&1
+          sudo apt-get install -y default-mysql-client rclone >/dev/null 2>&1
+
+      - name: Configure R2
+        run: |
+          mkdir -p ~/.config/rclone
+          cat <<EOF > ~/.config/rclone/rclone.conf
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          endpoint = ${{ secrets.R2_ENDPOINT }}
+          acl = private
+          EOF
+
+      - name: Dump & Verify
+        run: |
+          set -o pipefail
+          set +x
+
+          mysqldump \
+            --single-transaction --quick --skip-extended-insert --complete-insert \
+            --set-gtid-purged=OFF \
+            --default-character-set=utf8mb4 \
+            --column-statistics=0 \
+            -h${{ secrets.F_DB_HOST }} -P${{ secrets.F_DB_PORT }} \
+            -u${{ secrets.F_DB_USER }} -p"${{ secrets.F_DB_PASSWORD }}" \
+            --ssl-mode=DISABLED \
+            --databases ${{ secrets.F_DB_DATA }} \
+            2>/dev/null \
+            | gzip > latest_backup.sql.gz 2>/dev/null
+
+          if [ $? -ne 0 ]; then
+            echo "Error"
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat -c%s latest_backup.sql.gz)
+          if [ "$FILE_SIZE" -lt 10240 ]; then
+            echo "Error"
+            exit 1
+          fi
+
+      - name: Upload to R2
+        run: |
+          set +x
+          rclone copy latest_backup.sql.gz r2:${{ secrets.R2_BUCKET }}/f_db-backups/ \
+            --s3-no-check-bucket --checksum -q >/dev/null 2>&1
+
+          if [ $? -ne 0 ]; then
+            echo "Error"
+            exit 1
+          fi
+
+          echo "Success"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf ~/.config/rclone >/dev/null 2>&1
+          rm -f latest_backup.sql.gz >/dev/null 2>&1
+      - name: Create keep-alive commit
+        run: |
+          echo "Last backup: $(date -u '+%Y-%m-%d %H:%M:%S UTC') | ID: $(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 8)" > keepalive.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add keepalive.md || true
+
+      - name: Commit & Push if changed
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: ...
+          file_pattern: keepalive.md
+          push_options: '--force'    # 或 --force-with-lease
