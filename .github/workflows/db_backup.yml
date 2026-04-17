@@ -73,12 +73,6 @@ jobs:
           # 避免 utf8mb3，统一成 utf8mb4
           sed -i 's/utf8mb3/utf8mb4/g' structure_clean.sql
 
-          # 可选：清理 CHECK / INVISIBLE / 生成列
-          sed -i 's/ CHECK ([^)]*)//g' structure_clean.sql
-          sed -i 's/ INVISIBLE//g' structure_clean.sql
-          sed -i 's/ GENERATED ALWAYS AS ([^)]*) VIRTUAL//g' structure_clean.sql
-          sed -i 's/ GENERATED ALWAYS AS ([^)]*) STORED//g' structure_clean.sql
-
           # 压缩结构文件，单独保留一个小包
           cp structure_clean.sql structure_only.sql
           gzip structure_only.sql
@@ -116,10 +110,6 @@ jobs:
         run: |
           cat structure_clean.sql data.sql > full_backup.sql
 
-          # 再保险：如果 data 段里哪天混进 collation，也一锅端
-          sed -i 's/utf8mb4_0900_ai_ci/utf8mb4_general_ci/g' full_backup.sql
-          sed -i 's/utf8mb4_0900_bin/utf8mb4_general_ci/g' full_backup.sql
-          sed -i 's/utf8mb3/utf8mb4/g' full_backup.sql
 
           gzip full_backup.sql
 
