@@ -66,12 +66,6 @@ jobs:
         run: |
           cp structure_raw.sql structure_clean.sql
 
-          # 直接把 MySQL 8 专用排序规则换成兼容的
-          sed -i 's/utf8mb4_0900_ai_ci/utf8mb4_general_ci/g' structure_clean.sql
-          sed -i 's/utf8mb4_0900_bin/utf8mb4_general_ci/g' structure_clean.sql
-
-          # 避免 utf8mb3，统一成 utf8mb4
-          sed -i 's/utf8mb3/utf8mb4/g' structure_clean.sql
 
           # 压缩结构文件，单独保留一个小包
           cp structure_clean.sql structure_only.sql
